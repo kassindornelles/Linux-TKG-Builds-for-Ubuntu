@@ -1,0 +1,1443 @@
+#!/bin/bash
+
+# Needed for prompting with the correct order
+_supported_kernels=("5.13" "5.12" "5.11" "5.10" "5.9" "5.8" "5.7" "5.4")
+
+typeset -A _kver_subver_map
+_kver_subver_map=(
+  ["5.4"]="130"
+  ["5.7"]="19"
+  ["5.8"]="18"
+  ["5.9"]="16"
+  ["5.10"]="48"
+  ["5.11"]="22"
+  ["5.12"]="15"
+  ["5.13"]="1"
+)
+
+_undefine() {
+  for _config_name in "$@"; do
+    scripts/config -k --undefine "${_config_name}"
+  done
+}
+
+_enable() {
+  for _config_name in "$@"; do
+    scripts/config -k --enable "${_config_name}"
+  done
+}
+
+_disable() {
+  for _config_name in "$@"; do
+    scripts/config -k --disable "${_config_name}"
+  done
+}
+
+_module() {
+  for _config_name in "$@"; do
+    scripts/config -k --module "${_config_name}"
+  done
+}
+
+_prompt_from_array() {
+  # Prompts from array, selects default index on empty user input
+  # Set the _default_index variable to enable default index selection
+
+  if [ $# = "0" ]; then
+    warning "Prompting on an empty array, please report this issue."
+    exit 1
+  fi
+
+  _N=$(($#-1))
+  _index=0
+  for _value in "$@"; do
+    if [ "$_index" = "$_default_index" ]; then
+      plain "  > ${_index}) ${_value}"
+    else
+      plain "    ${_index}) ${_value}"
+    fi
+    _index=$(($_index + 1))
+  done
+  while true; do
+    read -rp "[0-${_N}]: ";
+    if [[ -z "$REPLY" && -n "$_default_index" ]]; then
+      _selected_index="$_default_index"
+      break
+    elif [[ "$REPLY" =~ ^[0-9]+$ && 0 -le "$REPLY" && "$REPLY" -le $_N ]]; then
+      _selected_index="$REPLY"
+      break
+    else
+      echo "Wrong selection: select any number in 0-$_N"
+    fi
+  done
+
+  _natural_index=$(($_selected_index + 1))
+  _selected_value="${!_natural_index}"
+  plain "Selected: ${_selected_value}"
+
+  unset _natural_index
+  unset _default_index
+}
+
+_set_kernel_version() {
+
+  if [ -z "$_version" ] || ! [[  "${!_kver_subver_map[*]}" =~ "$_version" ]]; then
+    msg2 "Which kernel version do you want to install?"
+
+    # Create a list of kernels versions with their sub-version added and prompt from it
+    _kernel_fullver_list=()
+    for _key in "${_supported_kernels[@]}"; do
+      _kernel_fullver_list+=("${_key}.${_kver_subver_map[$_key]}")
+    done
+
+    #Default index corresponds to latest stable kernel
+    _default_index="0"
+    _prompt_from_array  "${_kernel_fullver_list[@]}"
+    _version=${_supported_kernels[$_selected_index]}
+  fi
+
+  # Note: _basekernel and _version variables can be merged
+  _basekernel="$_version"
+  _basever=`echo $_version | tr -d "."`
+  _sub=${_kver_subver_map[$_version]}
+
+  echo -e "_basekernel='$_basekernel'\n_basever='$_basever'\n_sub='$_sub'" > "$_where"/BIG_UGLY_FROGMINER
+}
+
+_set_cpu_scheduler() {
+  declare -A _sched_description_array
+  _sched_description_array=(
+    ["pds"]="Project C / PDS"
+    ["bmq"]="Project C / BMQ"
+    ["cfs"]="CFS (Completely Fair Scheduler) Linux kernel's default"
+    ["muqss"]="MuQSS (Multiple Queue Skiplist Scheduler)"
+    ["upds"]="Undead PDS (TkG)"
+    ["cacule"]="CacULE"
+  )
+
+  # CPU SCHED selector
+  if [ "$_basever" = "54" ]; then
+    _avail_cpu_scheds=("pds" "bmq" "muqss" "cacule" "cfs")
+  elif [ "$_basever" = "57" ]; then
+    _avail_cpu_scheds=("pds" "bmq" "muqss" "cfs")
+  elif [ "$_basever" = "58" ]; then
+    _avail_cpu_scheds=("upds" "pds" "bmq" "cfs")
+  elif [[ "$_basever" =~ ^(59|511)$ ]]; then
+    _avail_cpu_scheds=("upds" "pds" "bmq" "muqss" "cfs")
+  elif [ "$_basever" = "510" ]; then
+    _avail_cpu_scheds=("upds" "pds" "bmq" "muqss" "cacule" "cfs")
+  elif [ "$_basever" = "512" ]; then
+    _avail_cpu_scheds=("pds" "bmq" "muqss" "cacule" "cfs")
+  elif [ "$_basever" = "513" ]; then
+    _avail_cpu_scheds=("pds" "bmq" "cacule" "cfs")
+  else
+    _avail_cpu_scheds=("cfs")
+  fi
+
+  # Populate descriptions of the available CPU schedulers
+  _avail_cpu_scheds_text=()
+  for _sched in "${_avail_cpu_scheds[@]}"; do
+    _avail_cpu_scheds_text+=("${_sched_description_array[$_sched]}")
+  done
+
+  if ! [[ ${_avail_cpu_scheds[*]} =~ "$_cpusched" ]]; then
+    warning "Your cpusched selection ( $_cpusched ) is not available for the selected kernel version."
+    if [ "$_nofallback" = "true" ]; then
+      warning "Since _nofallback is enabled, let's exit..."
+      exit 1
+    else
+      warning "Please select another"
+      _cpusched=""
+    fi
+  fi
+
+  if [ -z "$_cpusched" ]; then
+    msg2 "Which CPU sched variant do you want to build/install?"
+    msg2 "Project C (pds) / BMQ (bmq) is usually a good balance for gaming."
+    msg2 "Select \"cfs\" (linux kernel's default) if unsure."
+
+    _default_index="0"
+    _prompt_from_array "${_avail_cpu_scheds_text[@]}"
+    _cpusched=${_avail_cpu_scheds[$_selected_index]}
+  fi
+
+  echo -e "_cpusched='$_cpusched'" >> "$_where"/BIG_UGLY_FROGMINER
+}
+
+_set_compiler(){
+  if ! [[ "$_compiler" =~ ^(gcc|llvm)$ ]]; then
+    if [ -n "$_compiler" ] && [ "$_nofallback" = "true" ]; then
+      msg2 "Compiler \" $_compiler \" not recognized, exiting... "
+      exit 1
+    else
+      plain "Which compiler do you want to use?"
+      _compiler_array_text=("GCC (recommended)" "Clang/LLVM")
+      _compiler_array=("gcc" "llvm")
+
+      _default_index="0"
+      _prompt_from_array "${_compiler_array_text[@]}"
+      _compiler="${_compiler_array[$_selected_index]}"
+    fi
+  fi
+
+  if [ "$_compiler" = "llvm" ]; then
+    _compiler_name="-llvm"
+    llvm_opt="LLVM=1"
+    if [ $_basever -ge 512 ]; then
+      if [[ -z "$_lto_mode" || ! "$_lto_mode" =~ ^(no|thin|full)$ ]]; then
+        plain "Would you like to enable Clang Link Time Optimizations (LTO) ? It may improve the performance of the kernel."
+        warning "This is currently experimental and might result in an unbootable kernel - Not recommended"
+        _lto_prompt_array=(
+          "No: do not enable LTO"
+          "Full: uses 1 thread for Linking, slow and uses more memory, theoretically with the highest performance gains."
+          "Thin: uses multiple threads, faster and uses less memory, may have a lower runtime performance than Full."
+        )
+        _lto_mode_array=("no" "full" "thin")
+
+        _default_index="0"
+        _prompt_from_array "${_lto_prompt_array[@]}"
+        _lto_mode="${_lto_mode_array[$_selected_index]}"
+      fi
+      if [ "$_lto_mode" != "no" ]; then
+        llvm_opt="LLVM=1 LLVM_IAS=1"
+      fi
+    elif [[ -n "$_lto_mode" && "$_lto_mode" != "no" ]]; then
+      warning "Clang LTO is only available on linux 5.12 onwards."
+      _lto_mode="no"
+    fi
+  else # GCC
+    _compiler_name=""
+    llvm_opt=""
+  fi
+
+  echo -e "_compiler_name='$_compiler_name'\nllvm_opt='$llvm_opt'" >> "$_where"/BIG_UGLY_FROGMINER
+}
+
+
+_tkg_initscript() {
+
+  # Default to Arch
+  if [ -z "$_distro" ] || [ "$_ispkgbuild" = "true" ]; then
+    msg2 "Defaulting to Archlinux target\n"
+    _distro="Arch"
+  fi
+
+  # create build dir early
+  if [ "$_distro" = "Void" ]; then
+    _path="${XBPS_BUILDDIR}/${wrksrc}"
+  else
+    _path="${_where}"
+  fi
+
+  # Select Kernel version
+  _set_kernel_version
+
+  # Select CPU scheduler
+  _set_cpu_scheduler
+
+  if [ "$_distro" != "Void" ]; then
+    cp "$_where"/linux-tkg-patches/${_basekernel}/* "$_where" # copy patches inside the PKGBUILD's dir to preserve makepkg sourcing and md5sum checking
+    cp "$_where"/linux-tkg-config/${_basekernel}/* "$_where" # copy config files and hooks inside the PKGBUILD's dir to preserve makepkg sourcing and md5sum checking
+  else
+    cp "$_where"/linux-tkg-patches/${_basekernel}/* "$_path"
+    cp "$_where"/linux-tkg-config/${_basekernel}/* "$_path"
+  fi
+
+  if [[ -z "$_OPTIPROFILE" || ! "$_OPTIPROFILE" =~ ^(1|2|3)$ ]]; then
+    # Prompt about optimized configurations. Available variable values will overwrite customization.cfg/external config ones.
+    plain "Do you want to use a predefined optimized profile?"
+    _default_index="0"
+    _prompt_from_array "Custom" "Ryzen Desktop (Performance)" "Other Desktop (Performance)"
+    _OPTIPROFILE=$((${_selected_index}+1))
+  fi
+  if [ "$_OPTIPROFILE" = "2" ]; then
+    source "$_where"/linux-tkg-config/ryzen-desktop-profile.cfg && msg2 "Ryzen Desktop (Performance) profile will be used." && msg2 ""
+  elif [ "$_OPTIPROFILE" = "3" ]; then
+    source "$_where"/linux-tkg-config/generic-desktop-profile.cfg && msg2 "Generic Desktop (Performance) profile will be used." && msg2 ""
+  fi
+
+  # Set compiler
+  _set_compiler
+
+  if [ -n "$_custom_pkgbase" ]; then
+    echo -e "_custom_pkgbase=\"$_custom_pkgbase\"" >> "$_where"/BIG_UGLY_FROGMINER
+  fi
+}
+
+user_patcher() {
+    for _f in "$_where"/*."${_userpatch_ext}patch" "$_where"/*."${_userpatch_ext}revert"; do
+      [ -e "${_f}" ] || continue
+      warning "Found userpatch file ${f##*/} in the PKGBUILD directory."
+      warning "Userpatches must now be placed in version-specific subdirectories (linux${_basever}-tkg-userpatches for this kernel version)."
+      warning "The patch will not be applied."
+      break
+    done
+
+	# To patch the user because all your base are belong to us
+	local _patches=("$_where"/linux"$_basever"-tkg-userpatches/*."${_userpatch_ext}revert")
+	if [ ${#_patches[@]} -ge 2 ] || [ -e "${_patches}" ]; then
+	  if [ "$_user_patches_no_confirm" != "true" ]; then
+	    msg2 "Found ${#_patches[@]} 'to revert' userpatches for ${_userpatch_target}:"
+	    printf '%s\n' "${_patches[@]}"
+	    read -rp "Do you want to install it/them? - Be careful with that ;)"$'\n> N/y : ' _CONDITION;
+	  fi
+	  if [[ "$_CONDITION" =~ [yY] ]] || [ "$_user_patches_no_confirm" = "true" ]; then
+	    for _f in "${_patches[@]}"; do
+	      if [ -e "${_f}" ]; then
+	        msg2 "######################################################"
+	        msg2 ""
+	        msg2 "Reverting your own ${_userpatch_target} patch ${_f}"
+	        msg2 ""
+	        msg2 "######################################################"
+	        patch -Np1 -R < "${_f}"
+	        echo "Reverted your own patch ${_f}" >> "$_where"/last_build_config.log
+	      fi
+	    done
+	  fi
+	fi
+
+	_patches=("$_where"/linux"$_basever"-tkg-userpatches/*."${_userpatch_ext}patch")
+	if [ ${#_patches[@]} -ge 2 ] || [ -e "${_patches}" ]; then
+	  if [ "$_user_patches_no_confirm" != "true" ]; then
+	    msg2 "Found ${#_patches[@]} userpatches for ${_userpatch_target}:"
+	    printf '%s\n' "${_patches[@]}"
+	    read -rp "Do you want to install it/them? - Be careful with that ;)"$'\n> N/y : ' _CONDITION;
+	  fi
+	  if [[ "$_CONDITION" =~ [yY] ]] || [ "$_user_patches_no_confirm" = "true" ]; then
+	    for _f in "${_patches[@]}"; do
+	      if [ -e "${_f}" ]; then
+	        msg2 "######################################################"
+	        msg2 ""
+	        msg2 "Applying your own ${_userpatch_target} patch ${_f}"
+	        msg2 ""
+	        msg2 "######################################################"
+	        patch -Np1 < "${_f}"
+	        echo "Applied your own patch ${_f}" >> "$_where"/last_build_config.log
+	      fi
+	    done
+	  fi
+	fi
+}
+
+_tkg_patcher() {
+  if [ -e "$tkgpatch" ]; then
+    msg2 "$_msg"
+    echo -e "### Applying ${tkgpatch##*/}... ###" >> "$_where"/prepare.log
+    patch -Np1 -i "$tkgpatch" >> "$_where"/prepare.log || error "An error was encountered applying patches. It was logged to the prepare.log file."
+    echo -e "\n" >> "$_where"/prepare.log
+  else
+    if [[ $_msg != *graysky* ]]; then
+      msg2 "Skipping patch ${tkgpatch##*/}...\n         (unavailable for this kernel version)"
+    fi
+  fi
+}
+
+_tkg_srcprep() {
+
+  if [ "${_distro}" = "Void" ] && [ -e ${srcdir}/sum_failed ]; then
+    exit 1
+  fi
+
+  msg2 "Setting version..."
+  scripts/setlocalversion --save-scmversion
+
+  if [ "${_distro}" = "Arch" ]; then
+    echo "-$pkgrel-tkg-${_cpusched}${_compiler_name}" > localversion.10-pkgrel
+    echo -e "Version tail set to \"-$pkgrel-tkg-${_cpusched}${_compiler_name}\"\n" > "$_where"/prepare.log
+    echo "" > localversion.20-pkgname
+
+    # add upstream patch
+    if [ "$_sub" != "0" ] && [[ "$_sub" != rc* ]]; then
+      if [ ! -e "$srcdir/patch-${pkgver}" ]; then
+        if [ -e "$srcdir/patch-${pkgver}.xz" ]; then
+          xz -dk "$(readlink -f "$srcdir/patch-${pkgver}.xz")" --stdout > "$srcdir/patch-${pkgver}"
+        else
+          ( cd "$_where" && xz -dk patch-${pkgver}.xz && mv "$_where"/patch-${pkgver} "$srcdir"/ )
+        fi
+      fi
+      tkgpatch="$srcdir/patch-${pkgver}"
+      _msg="Patching from $_basekernel to $pkgver" && _tkg_patcher
+    fi
+
+    # ARCH Patches
+    if [ "${_configfile}" = "config_hardened.x86_64" ] && [ "${_cpusched}" = "cfs" ]; then
+      tkgpatch="$srcdir/0012-linux-hardened.patch"
+      _msg="Using linux hardened patchset" && _tkg_patcher
+    else
+      tkgpatch="$srcdir/0001-add-sysctl-to-disallow-unprivileged-CLONE_NEWUSER-by.patch"
+      _msg="Using Arch patches" && _tkg_patcher
+    fi
+  fi
+
+  # Void
+  if [ "$_distro" = "Void" ] && [[ "$_sub" = rc* ]]; then
+    cd ${wrksrc}/linux-${_rc_kern_ver}
+  elif [ "$_distro" = "Void" ]; then
+    cd ${wrksrc}/linux-${_kern_ver}
+  fi
+
+  if [ -z $_debug ]; then
+
+  # graysky's cpu opts - https://github.com/graysky2/kernel_compiler_patch
+  if [ "${_distro}" = "Arch" ]; then
+    tkgpatch="$srcdir/more-uarches-for-kernel-${opt_ver}.patch"
+  elif [ "${_distro}" = "Void" ]; then
+    tkgpatch="${wrksrc}/more-uarches-for-kernel-${opt_ver}.patch"
+  else
+    tkgpatch="$srcdir/more-uarches-for-kernel-${opt_ver}.patch"
+  fi
+  _msg="Applying graysky's cpu opts patch" && _tkg_patcher
+
+  if [ "${_distro}" = "Arch" ]; then
+    tkgpatch="$srcdir/enable_additional_cpu_optimizations_for_gcc_v10.1%2B_kernel_v${opt_ver}.patch"
+  elif [ "${_distro}" = "Void" ]; then
+    tkgpatch="${wrksrc}/enable_additional_cpu_optimizations_for_gcc_v10.1+_kernel_v${opt_ver}.patch"
+  else
+    tkgpatch="$srcdir/enable_additional_cpu_optimizations_for_gcc_v10.1+_kernel_v${opt_ver}+.patch"
+  fi
+  _msg="Applying graysky's cpu opts patch (legacy)" && _tkg_patcher
+
+  # TkG
+  tkgpatch="$srcdir/0002-clear-patches.patch"
+  _msg="Applying clear linux patches" && _tkg_patcher
+
+  tkgpatch="$srcdir/0003-glitched-base.patch"
+  _msg="Applying glitched base patch" && _tkg_patcher
+
+  if [ -z $_misc_adds ]; then
+    plain "Enable misc additions ? They may contain temporary fixes pending upstream, or some other changes that can break on non-Arch distros."
+    read -rp "`echo $'    > [Y]/n : '`" _interactive_misc_adds;
+    if [ "$_interactive_misc_adds" != "n" ] && [ "$_interactive_misc_adds" != "N" ]; then
+      _misc_adds="true"
+    fi
+  fi
+
+  if [ "$_misc_adds" = "true" ]; then
+    tkgpatch="$srcdir/0012-misc-additions.patch"
+    _msg="Applying misc additions patch" && _tkg_patcher
+  fi
+
+  if [ "$_basever" = "511" ] || [ "$_basever" = "512" ]; then
+    _msg="Applying patches for WRITE_WATCH support in Wine"
+    tkgpatch="$srcdir/0001-mm-Support-soft-dirty-flag-reset-for-VA-range.patch" && _tkg_patcher
+    tkgpatch="$srcdir/0002-mm-Support-soft-dirty-flag-read-with-reset.patch" && _tkg_patcher
+  fi
+
+  # prjc/bmq patch rev
+  if [ "$_basever" = "58" ] || [ "$_basever" = "57" ]; then
+    rev=3
+  elif [ "$_basever" = "59" ]; then
+    rev=3
+  elif [ "$_basever" = "510" ]; then
+    rev=2
+  elif [ "$_basever" = "511" ]; then
+    rev=3
+  elif [ "$_basever" = "512" ]; then
+    rev=1
+  elif [ "$_basever" = "513" ]; then
+    rev=1
+  else
+    rev=0
+  fi
+
+  if [ "${_cpusched}" = "muqss" ]; then
+    # MuQSS
+    _msg="Applying MuQSS base patch"
+    tkgpatch="$srcdir/0004-${_basekernel}-ck1.patch" && _tkg_patcher
+
+    if [ "${_aggressive_ondemand}" = "true" ]; then
+      _msg="Applying MuQSS agressive ondemand governor patch"
+      tkgpatch="$srcdir/0004-glitched-ondemand-muqss.patch" && _tkg_patcher
+    fi
+
+    _msg="Applying Glitched MuQSS patch"
+    tkgpatch="$srcdir/0004-glitched-muqss.patch" && _tkg_patcher
+
+  elif [ "${_cpusched}" = "upds" ] || [ "${_cpusched}" = "pds" ]; then
+    # upds naming quirk
+    if [ "${_cpusched}" = "upds" ];then
+      # is it dead or alive
+      doa="-undead"
+    fi
+
+    # PDS-mq
+    _msg="Applying PDS base patch"
+    if [ "${_cpusched}" = "upds" ] || ( [ "$_basever" = "54" ] || [ "$_basever" = "57" ] && [ "${_cpusched}" = "pds" ] ); then
+      tkgpatch="$srcdir/0005-v${_basekernel}_undead-pds099o.patch" && _tkg_patcher
+      if [ "${_aggressive_ondemand}" = "true" ]; then
+        _msg="Applying PDS agressive ondemand governor patch"
+        tkgpatch="$srcdir/0005${doa}-glitched-ondemand-pds.patch" && _tkg_patcher
+      fi
+    else
+      tkgpatch="$srcdir/0009-prjc_v${_basekernel}-r${rev}.patch" && _tkg_patcher
+      if [ "${_aggressive_ondemand}" = "true" ]; then
+        _msg="Applying prjc PDS/BMQ agressive ondemand governor patch"
+        tkgpatch="$srcdir/0009-glitched-ondemand-bmq.patch" && _tkg_patcher
+      fi
+    fi
+
+    _msg="Applying Glitched PDS patch"
+    tkgpatch="$srcdir/0005${doa}-glitched-pds.patch" && _tkg_patcher
+
+  elif [ "${_cpusched}" = "bmq" ]; then
+    # Project C / BMQ
+    _msg="Applying Project C / BMQ base patch"
+    if [ "$_basever" != "54" ]; then
+      tkgpatch="$srcdir/0009-prjc_v${_basekernel}-r${rev}.patch" && _tkg_patcher
+    else
+      tkgpatch="$srcdir/0009-bmq_v5.4-r2.patch" && _tkg_patcher
+    fi
+
+    if [ "${_aggressive_ondemand}" = "true" ] && [ "$_basever" != "54" ]; then
+      _msg="Applying BMQ agressive ondemand governor patch"
+      tkgpatch="$srcdir/0009-glitched-ondemand-bmq.patch" && _tkg_patcher
+    fi
+
+    _msg="Applying Glitched BMQ patch"
+    tkgpatch="$srcdir/0009-glitched-bmq.patch" && _tkg_patcher
+  elif [ "${_cpusched}" = "cacule" ]; then
+    _msg="Applying cacule patch"
+    tkgpatch="$srcdir/0003-cacule-${_basekernel}.patch" && _tkg_patcher
+    _msg="Applying Glitched CFS patch"
+    tkgpatch="$srcdir/0003-glitched-cfs.patch" && _tkg_patcher
+  elif [ "${_cpusched}" = "cfs" ]; then
+    _msg="Applying Glitched CFS patch"
+    tkgpatch="$srcdir/0003-glitched-cfs.patch" && _tkg_patcher
+    _msg="Applying Glitched CFS additions patch"
+    tkgpatch="$srcdir/0003-glitched-cfs-additions.patch" && _tkg_patcher
+  fi
+
+  fi
+
+  if [ "$_distro" = "Void" ] && [[ "$_sub" = rc* ]]; then
+    cd ${wrksrc}/linux-${_rc_kern_ver}
+  elif [ "$_distro" = "Void" ] && [[ "$_sub" != rc* ]]; then
+    cd ${wrksrc}/linux-${_kern_ver}
+  fi
+
+
+  if [ -z "${_configfile}" ]; then
+    if [ "${_distro}" = "Arch" ] || [ "$_distro" = "Void" ]; then
+      cat "${srcdir}"/config.x86_64 > ./.config
+    else
+      if [ -f /boot/config-`uname -r` ];then
+        msg2 "Using /boot/config-`uname -r` as config file"
+        cp /boot/config-`uname -r` .config
+      elif [ -f /proc/config.gz ];then
+        msg2 "Using /proc/config.gz as config file"
+        zcat --verbose /proc/config.gz > .config
+      else
+        msg2 "Current kernel config not found! Falling back to default..."
+      fi
+    fi
+  else
+    msg2 "Using user-provided config file in ${_where}/${_configfile}"
+    cat "${_where}/${_configfile}" > ./.config
+  fi
+
+  if [ "${_distro}" = "Arch" ]; then
+    # Reset local version string if ever it's in the .config file
+    scripts/config --set-str localversion ""
+  fi
+
+  if [ -z $_debug ]; then
+
+  # Set some -tkg defaults
+  _disable "DYNAMIC_FAULT" "DEFAULT_FQ_CODEL"
+  _enable "DEFAULT_CAKE"
+  if [ "$_basever" = "54" ]; then
+    _module "TP_SMAPI"
+    _enable "RAID6_USE_PREFER_GEN"
+  fi
+  if [ "$_basever" = "54" ] || [ "$_basever" = "59" ]; then
+    scripts/config --set-val "RCU_BOOST_DELAY" "0"
+  fi
+  _disable "NTP_PPS" "CPU_FREQ_DEFAULT_GOV_PERFORMANCE_NODEF" "ZSWAP_COMPRESSOR_DEFAULT_LZO"
+  _enable "CRYPTO_LZ4" "CRYPTO_LZ4HC" "LZ4_COMPRESS" "LZ4HC_COMPRESS" "ZSWAP_COMPRESSOR_DEFAULT_LZ4" "CMDLINE_BOOL"
+  scripts/config --set-str "ZSWAP_COMPRESSOR_DEFAULT" "lz4"
+  if [ "$_futex2" = "true" ] && [ "$_basever" != "54" ] && [ "$_basever" != "57" ] && [ "$_basever" != "58" ] && [ "$_basever" != "59" ]; then
+    sed -i -e 's/# CONFIG_EXPERT is not set/CONFIG_EXPERT=y/' ./.config
+    echo -e "\r# start of config expert\r
+# CONFIG_DEBUG_RSEQ is not set\r
+# CONFIG_PC104 is not set\r
+# CONFIG_SLUB_MEMCG_SYSFS_ON is not set\r
+# CONFIG_SLOB is not set\r
+# CONFIG_PROCESSOR_SELECT is not set\r
+# CONFIG_SUSPEND_SKIP_SYNC is not set\r
+# CONFIG_DPM_WATCHDOG is not set\r
+# CONFIG_ACPI_REDUCED_HARDWARE_ONLY is not set\r
+# CONFIG_PCI_CNB20LE_QUIRK is not set\r
+# CONFIG_ISA_BUS is not set\r
+CONFIG_KVM_WERROR=y\r
+# CONFIG_GCC_PLUGIN_CYC_COMPLEXITY is not set\r
+# CONFIG_CFG80211_CERTIFICATION_ONUS is not set\r
+# CONFIG_PCIE_BUS_TUNE_OFF is not set\r
+CONFIG_PCIE_BUS_DEFAULT=y\r
+# CONFIG_PCIE_BUS_SAFE is not set\r
+# CONFIG_PCIE_BUS_PERFORMANCE is not set\r
+# CONFIG_PCIE_BUS_PEER2PEER is not set\r
+# CONFIG_PATA_PLATFORM is not set\r
+# CONFIG_TTY_PRINTK is not set\r
+# CONFIG_GPIO_SYSFS is not set\r
+# CONFIG_VIDEO_TDA1997X is not set\r
+# CONFIG_VIDEO_TLV320AIC23B is not set\r
+# CONFIG_VIDEO_ADV7180 is not set\r
+# CONFIG_VIDEO_ADV7183 is not set\r
+# CONFIG_VIDEO_ADV7604 is not set\r
+# CONFIG_VIDEO_ADV7842 is not set\r
+# CONFIG_VIDEO_BT819 is not set\r
+# CONFIG_VIDEO_BT856 is not set\r
+# CONFIG_VIDEO_BT866 is not set\r
+# CONFIG_VIDEO_KS0127 is not set\r
+# CONFIG_VIDEO_ML86V7667 is not set\r
+# CONFIG_VIDEO_SAA7110 is not set\r
+# CONFIG_VIDEO_TC358743 is not set\r
+# CONFIG_VIDEO_TVP514X is not set\r
+# CONFIG_VIDEO_TVP7002 is not set\r
+# CONFIG_VIDEO_TW9910 is not set\r
+# CONFIG_VIDEO_VPX3220 is not set\r
+# CONFIG_VIDEO_SAA7185 is not set\r
+# CONFIG_VIDEO_ADV7170 is not set\r
+# CONFIG_VIDEO_ADV7175 is not set\r
+# CONFIG_VIDEO_ADV7343 is not set\r
+# CONFIG_VIDEO_ADV7393 is not set\r
+# CONFIG_VIDEO_ADV7511 is not set\r
+# CONFIG_VIDEO_AD9389B is not set\r
+# CONFIG_VIDEO_AK881X is not set\r
+# CONFIG_VIDEO_THS8200 is not set\r
+# CONFIG_VIDEO_THS7303 is not set\r
+# CONFIG_VIDEO_I2C is not set\r
+# CONFIG_VIDEO_ST_MIPID02 is not set\r
+# CONFIG_VIDEO_GS1662 is not set\r
+# CONFIG_MEDIA_TUNER_MSI001 is not set\r
+# CONFIG_DVB_S5H1432 is not set\r
+# CONFIG_DVB_DIB9000 is not set\r
+# CONFIG_DVB_CXD2880 is not set\r
+# CONFIG_DVB_MN88443X is not set\r
+# CONFIG_DVB_LNBH29 is not set\r
+# CONFIG_DVB_LGS8GL5 is not set\r
+# CONFIG_DRM_DEBUG_DP_MST_TOPOLOGY_REFS is not set\r
+# CONFIG_DRM_FBDEV_LEAK_PHYS_SMEM is not set\r
+# CONFIG_DRM_I915_WERROR is not set\r
+# CONFIG_DRM_I915_DEBUG is not set\r
+# CONFIG_DRM_I915_DEBUG_MMIO is not set\r
+# CONFIG_DRM_I915_SW_FENCE_DEBUG_OBJECTS is not set\r
+# CONFIG_DRM_I915_SW_FENCE_CHECK_DAG is not set\r
+# CONFIG_DRM_I915_DEBUG_GUC is not set\r
+# CONFIG_DRM_I915_SELFTEST is not set\r
+# CONFIG_DRM_I915_LOW_LEVEL_TRACEPOINTS is not set\r
+# CONFIG_DRM_I915_DEBUG_VBLANK_EVADE is not set\r
+# CONFIG_DRM_I915_DEBUG_RUNTIME_PM is not set\r
+# CONFIG_FB_INTEL is not set\r
+# CONFIG_SND_SOC_SOF_DEVELOPER_SUPPORT is not set\r
+# CONFIG_USB_KBD is not set\r
+# CONFIG_USB_MOUSE is not set\r
+# CONFIG_USB_OTG_DISABLE_EXTERNAL_HUB is not set\r
+# CONFIG_HARDENED_USERCOPY_PAGESPAN is not set\r
+CONFIG_PAHOLE_HAS_SPLIT_BTF=y\r
+CONFIG_DEBUG_INFO_BTF_MODULES=y\r
+# CONFIG_DEBUG_FORCE_FUNCTION_ALIGN_32B is not set\r
+# CONFIG_WIRELESS_WDS is not set\r
+# CONFIG_UNWINDER_GUESS is not set\r
+# CONFIG_TRIM_UNUSED_KSYMS is not set\r
+# end of config expert\n">> ./.config
+  fi
+  scripts/config --set-str "CMDLINE" "${_custom_commandline}"
+  _disable "CMDLINE_OVERRIDE" "X86_P6_NOP" "CPU_FREQ_DEFAULT_GOV_ONDEMAND" "CPU_FREQ_DEFAULT_GOV_CONSERVATIVE"
+  #echo "# CONFIG_CPU_FREQ_DEFAULT_GOV_PERFORMANCE is not set" >> ./.config
+
+  # openrgb
+  _module "I2C_NCT6775"
+
+  # ccache fix
+  if [ "$_noccache" != "true" ]; then
+    if { [ "$_distro" = "Arch" ] && pacman -Qq ccache &> /dev/null; } || { [ "$_distro" = "Ubuntu" ] && dpkg -l ccache > /dev/null; }\
+	    || { [ "$_distro" = "Void" ] && xbps-query -s ccache > /dev/null; } ; then
+      _disable "GCC_PLUGINS"
+    fi
+  fi
+  # Clang LTO
+  if [ "$_compiler_name" = "-llvm" ] && [ $_basever -ge 512 ]; then
+    if [ "$_lto_mode" = "full" ]; then
+      _enable LTO_CLANG_FULL
+      _disable LTO_CLANG_THIN
+    elif [ "$_lto_mode" = "thin" ]; then
+      _disable LTO_CLANG_FULL
+      _enable LTO_CLANG_THIN
+    fi
+  fi
+  # Void uses LibreSSL
+  if [ "$_distro" = "Void" ]; then
+    _disable "MODULE_SIG_SHA512"
+    _enable "MODULE_SIG_SHA1"
+    scripts/config --set-str "MODULE_SIG_HASH" "sha1"
+  fi
+
+  # Prevent Debian and Ubuntu to sign stuff because it breaks stuff
+  if [[ "$_distro" = "Debian" || "$_distro" = "Ubuntu" ]]; then
+    #Help Debian cert compile problem.
+    scripts/config --set-str "SYSTEM_TRUSTED_KEYS" ""
+  fi
+  # Skip dbg package creation on non-Arch
+  if [ "$_distro" != "Arch" ]; then
+    _disable "DEBUG_INFO"
+  fi
+
+  if [ "$_compiler_name" = "-llvm" ]; then
+    _disable "KCSAN"
+    if [ "$_basever" != "54" ] && [ "$_basever" != "57" ] && [ "$_basever" != "58" ]; then
+      _disable "INIT_STACK_ALL_PATTERN"
+    else
+      _disable "INIT_STACK_ALL"
+    fi
+    _enable "INIT_ON_FREE_DEFAULT_ON" "INIT_STACK_ALL_ZERO"
+    _disable "INIT_STACK_NONE"
+  fi
+
+  if [ "$_font_autoselect" != "false" ]; then
+    _disable "FONT_TER16x32"
+    _enable "FONT_AUTOSELECT"
+  fi
+
+  # cpu opt
+  if [ -n "$opt_ver" ]; then
+    _cpu_marchs=("native_amd" "native_intel" "generic_cpu" "generic_cpu2" "generic_cpu3" "generic_cpu4")
+    _cpu_marchs+=("k8" "k8sse3" "k10" "barcelona" "bobcat" "jaguar" "bulldozer" "piledriver")
+    _cpu_marchs+=("steamroller" "excavator" "zen" "zen2" "zen3" "mpsc" "atom" "core2" "nehalem" "westmere")
+    _cpu_marchs+=("bonnell" "silvermont" "sandybridge" "ivybridge" "haswell" "broadwell" "skylake")
+    _cpu_marchs+=("skylakex" "cannonlake" "icelake" "goldmont" "goldmontplus" "cascadelake")
+    _cpu_marchs+=("cooperlake" "tigerlake" "sapphirerapids" "rocketlake" "alderlake")
+
+    typeset -A _generic_march_map
+    _generic_march_map=(
+      ["generic"]="generic_cpu"
+      ["generic_v2"]="generic_cpu2"
+      ["generic_v3"]="generic_cpu3"
+      ["generic_v4"]="generic_cpu4"
+    )
+    if [ -n "$_processor_opt" ]; then
+      # Replace customization.cfg convention with .config convention for generic
+      if [[ "${!_generic_march_map[@]}" =~ "$_processor_opt" ]]; then
+        _processor_opt="${_generic_march_map[$_processor_opt]}"
+      fi
+      if ! [[ "${_cpu_marchs[@]}" =~ "$_processor_opt" ]]; then
+        warning "the setup _processor_opt=\"${_processor_opt}\" not recognized. Prompting..."
+        _processor_opt=""
+      fi
+    fi
+
+    if [ -z "$_processor_opt" ]; then
+      msg2 "Please select the desired CPU micro-architecture"
+      _default_index="2"
+      _prompt_from_array "${_cpu_marchs[@]}"
+      _processor_opt="${_selected_value}"
+    fi
+
+    for _march in "${_cpu_marchs[@]}"
+    do
+      _march_upper=`echo "$_march" | tr '[a-z]' '[A-Z]'`
+      if [ "$_processor_opt" = "$_march" ]; then
+        if [[ "$_march" = "generic"* ]]; then
+          _enable "${_march_upper}"
+        else
+          _enable "M${_march_upper}"
+        fi
+      else
+        if [[ "$_march" = "generic"* ]]; then
+          _disable "${_march_upper}"
+        else
+          _disable "M${_march_upper}"
+        fi
+      fi
+    done
+  fi
+
+  # Disable some debugging
+  if [ "${_debugdisable}" = "true" ]; then
+    _disable "SLUB_DEBUG" "PM_DEBUG" "PM_ADVANCED_DEBUG" "PM_SLEEP_DEBUG" "ACPI_DEBUG" "SCHED_DEBUG" "LATENCYTOP" "DEBUG_PREEMPT"
+  fi
+
+  # TCP algorithms
+  _tcp_cong_alg_list=("yeah" "bbr" "cubic" "vegas" "westwood" "reno")
+  _user_set_tcp_alg="false"
+
+  _enable "TCP_CONG_ADVANCED"
+
+  for _alg in "${_tcp_cong_alg_list[@]}"
+  do
+    _alg_upper=`echo "$_alg" | tr '[a-z]' '[A-Z]'`
+    _enable "TCP_CONG_${_alg_upper}"
+    if [ "$_tcp_cong_alg" = "$_alg" ];then
+      _user_set_tcp_alg="true"
+      _enable "DEFAULT_${_alg_upper}"
+      scripts/config --set-str "DEFAULT_TCP_CONG" "${_alg}"
+    else
+      _disable "DEFAULT_${_alg_upper}"
+    fi
+  done
+
+  if [ "$_user_set_tcp_alg" = "false" ];then
+    _enable "DEFAULT_CUBIC"
+    scripts/config --set-str DEFAULT_TCP_CONG "cubic"
+  fi
+
+  #######
+
+
+  if [ "${_cpusched}" = "muqss" ]; then
+    # MuQSS default config
+    _enable "SCHED_MUQSS"
+  elif [ "${_cpusched}" = "pds" ]; then
+    # PDS default config
+    _enable "SCHED_ALT" "SCHED_PDS"
+    _disable "SCHED_BMQ"
+  elif [ "${_cpusched}" = "cacule" ]; then
+    _enable "SCHED_AUTOGROUP" "CACULE_SCHED"
+    _disable "BSD_PROCESS_ACCT" "TASK_XACCT" "CGROUP_CPUACCT" "CGROUP_DEBUG"
+  elif [ "${_cpusched}" = "upds" ]; then
+    # PDS default config
+    _enable "SCHED_PDS"
+  elif [ "${_cpusched}" = "bmq" ]; then
+    # BMQ default config
+    _enable "SCHED_ALT" "SCHED_BMQ"
+    _disable "SCHED_PDS"
+  fi
+
+  if [[ "${_cpusched}" =~ ^(muqss|pds|bmq|upds)$ ]]; then
+    # Disable CFS
+    _disable "FAIR_GROUP_SCHED"
+    _disable "CFS_BANDWIDTH"
+
+    # for linux59-tkg _sched_yield_type is set to 0
+    if [ "$_basever" = "59" ]; then
+      _sched_yield_type="0"
+    fi
+    # sched yield type
+    if ! [[ "$_sched_yield_type" =~ ^(0|1|2)$ ]]; then
+      plain ""
+      plain "CPU sched_yield_type - Choose what sort of yield sched_yield will perform."
+      plain ""
+
+      _default_index="0"
+      if [ "${_cpusched}" = "muqss" ]; then
+        plain "For MuQSS"
+        yield_type_array_text=(
+          "No yield.\n        Supposedly best option for gaming performance but might lead to stability issues on some (AMD) platforms"
+          "Yield only to better priority/deadline tasks.\n        Could lead to stability issues on some (Intel) platforms"
+          "Expire timeslice and recalculate deadline.\n        Can be a good option with low rr_interval"
+        )
+      elif [[ "${_cpusched}" =~ ^(pds|upds)$ ]]; then
+        plain "For (U)PDS"
+        yield_type_array_text=(
+          "No yield.\n        Recommended option for gaming - \"tkg\" default"
+          "Yield only to better priority/deadline tasks.\n        Could lead to stability issues on some (Intel) platforms"
+          "Expire timeslice and recalculate deadline.\n        Can be a good option with low rr_interval"
+        )
+      else #BMQ
+        plain "For BMQ (experimental) - No recommended value yet, so try for yourself x) :"
+        yield_type_array_text=(
+          "No yield."
+          "Deboost and requeue task."
+          "Set rq skip task."
+        )
+      fi
+
+      _prompt_from_array "${yield_type_array_text[@]}"
+      _sched_yield_type="${_selected_index}"
+    fi
+    if [ "${_cpusched}" = "upds" ] || ( [ "$_basever" = "54" ] || [ "$_basever" = "57" ] && [ "${_cpusched}" = "pds" ] ); then
+      _sched="pds"
+    elif [ "${_cpusched}" = "muqss" ]; then
+      _sched="MuQSS"
+    elif ( [ "$_basever" != "54" ] && [ "$_cpusched" != "bmq" ] && [ "$_cpusched" != "pds" ] ) || ( [ "$_basever" = "54" ] && [ "$_cpusched" = "bmq" ] ); then
+      _sched="${_cpusched}"
+    else
+      _sched="alt_core"
+    fi
+    if [ "$_sched_yield_type" = "0" ]; then
+      sed -i -e 's/int sched_yield_type __read_mostly = 1;/int sched_yield_type __read_mostly = 0;/' ./kernel/sched/${_sched}.c
+    elif [ "$_sched_yield_type" = "1" ]; then
+      msg2 "Using default CPU sched yield type (1)"
+    elif [ "$_sched_yield_type" = "2" ]; then
+      sed -i -e 's/int sched_yield_type __read_mostly = 1;/int sched_yield_type __read_mostly = 2;/' ./kernel/sched/${_sched}.c
+    fi
+  fi
+
+  # Round Robin interval
+  if [[ "${_cpusched}" =~ ^(muqss|pds|bmq|upds)$ ]]; then
+    _rr_interval_array=("2" "4" "6" "8")
+    _rr_interval_array_text=("2ms" "4ms" "6ms" "8ms")
+
+    typeset -A _rr_interval_default_indexes
+    _rr_interval_default_indexes=(
+      ["muqss"]="2"
+      ["pds"]="1"
+      ["upds"]="1"
+      ["bmq"]="0"
+    )
+
+    _default_index="${_rr_interval_default_indexes[$_cpusched]}"
+
+    #Remove whitespaces from variable
+    _rr_interval=`echo ${_rr_interval} | tr -d " "`
+
+    if [ "${_rr_interval}" = "default" ]; then
+      _rr_interval="${_rr_interval_array[$_default_index]}"
+    elif [[ "$_rr_interval" =~ ^(1|2|3|4)$ ]]; then
+      _rr_interval=$(($_rr_interval * 2))
+    else
+      plain ""
+      plain "Round Robin interval is the longest duration two tasks with the same nice level will"
+      plain "be delayed for. When CPU time is requested by a task, it receives a time slice equal"
+      plain "to the rr_interval in addition to a virtual deadline. When using yield_type 2, a low"
+      plain "value can help offset the disadvantages of rescheduling a process that has yielded."
+      plain ""
+
+      _prompt_from_array "${_rr_interval_array_text[@]}"
+      _rr_interval="${_rr_interval_array[$_selected_index]}"
+    fi
+    msg2 "Using ${_rr_interval}ms round robin interval"
+
+    if [ "$_basever" != "54" ]; then
+      if [ "${_cpusched}" = "muqss" ]; then
+        sed -i -e "s/int rr_interval __read_mostly = 6;/int rr_interval __read_mostly = ${_rr_interval};/" ./kernel/sched/"${_sched}".c
+      elif [ "${_cpusched}" = "upds" ]; then
+        sed -i -e "s/#define SCHED_DEFAULT_RR (4)/#define SCHED_DEFAULT_RR (${_rr_interval})/" ./kernel/sched/pds.c
+      elif [ "${_cpusched}" = "bmq" ] || [ "${_cpusched}" = "pds" ]; then
+        sed -i -e "s/u64 sched_timeslice_ns __read_mostly = (4 * 1000 * 1000);/u64 sched_timeslice_ns __read_mostly = (${_rr_interval} * 1000 * 1000);/" ./kernel/sched/${_sched}.c
+      fi
+      if [ "${_cpusched}" = "bmq" ]; then
+        scripts/config --set-val "SCHED_TIMESLICE" "2"
+      fi
+    else
+      if [ "${_cpusched}" == "muqss" ]; then
+        sed -i -e "s/int rr_interval __read_mostly = 6;/int rr_interval __read_mostly = ${_rr_interval};/" ./kernel/sched/"${_sched}".c
+      elif [ "${_cpusched}" == "pds" ]; then
+        sed -i -e "s/#define SCHED_DEFAULT_RR (4)/#define SCHED_DEFAULT_RR (${_rr_interval})/" ./kernel/sched/"${_sched}".c
+      elif [ "${_cpusched}" == "bmq" ]; then
+        scripts/config --set-val "SCHED_TIMESLICE" "${_rr_interval}"
+      fi
+    fi
+  fi
+
+  # zenify
+  if [ "$_zenify" = "false" ]; then
+    _disable "ZENIFY"
+  else
+    _enable "ZENIFY"
+  fi
+
+  # compiler optimization level
+  if [ "$_compileroptlevel" = "1" ]; then
+    if [ "$_basever" != "54" ]; then
+      _disable "CC_OPTIMIZE_FOR_PERFORMANCE_O3"
+    else
+      _disable "CC_OPTIMIZE_HARDER"
+    fi
+  elif [ "$_compileroptlevel" = "2" ]; then
+    _disable "CC_OPTIMIZE_FOR_PERFORMANCE"
+    if [ "$_basever" != "54" ]; then
+      _enable "CC_OPTIMIZE_FOR_PERFORMANCE_O3"
+    else
+      _enable "CC_OPTIMIZE_HARDER"
+    fi
+  elif [ "$_compileroptlevel" = "3" ]; then
+    _disable "CC_OPTIMIZE_FOR_PERFORMANCE"
+    _enable "CC_OPTIMIZE_FOR_SIZE"
+    if [ "$_basever" != "54" ]; then
+      _disable "CC_OPTIMIZE_FOR_PERFORMANCE_O3"
+    else
+      _disable "CC_OPTIMIZE_HARDER"
+    fi
+  fi
+
+  # irq threading
+  if [ "$_irq_threading" = "true" ]; then
+    _enable "FORCE_IRQ_THREADING"
+  elif [ "$_irq_threading" = "false" ]; then
+    _disable "FORCE_IRQ_THREADING"
+  fi
+
+  # smt nice
+  if [ "$_smt_nice" = "true" ]; then
+    _enable "SMT_NICE"
+  elif [ "$_smt_nice" = "false" ]; then
+    _disable "SMT_NICE"
+  fi
+
+  # random trust cpu
+  if [ "$_random_trust_cpu" = "true" ]; then
+    _enable "RANDOM_TRUST_CPU"
+  fi
+
+  # rq sharing
+  if [ "${_cpusched}" = "muqss" ]; then
+    _disable "RQ_NONE" "RQ_SMT" "RQ_MC" "RQ_MC_LLC" "RQ_SMP" "RQ_ALL"
+    if [ "$_runqueue_sharing" = "none" ]; then
+      _enable "RQ_NONE"
+    elif [ -z "$_runqueue_sharing" ] || [ "$_runqueue_sharing" = "smt" ]; then
+      _enable "RQ_SMT"
+    elif [ "$_runqueue_sharing" = "mc" ]; then
+      _enable "RQ_MC"
+    elif [ "$_runqueue_sharing" = "smp" ]; then
+      _enable "RQ_SMP"
+    elif [ "$_runqueue_sharing" = "all" ]; then
+      _enable "RQ_ALL"
+    elif [ "$_runqueue_sharing" = "mc-llc" ]; then
+      _enable "RQ_MC_LLC"
+    fi
+  fi
+
+  # timer freq
+  _avail_timer_frequencies=("100" "250" "300" "500" "750" "1000")
+  _avail_timer_frequencies_text=("100 Hz" "250 Hz" "300 Hz" "500 Hz" "750 Hz" "1000 Hz")
+  if [ "$_cpusched" = "cacule" ]; then
+    _avail_timer_frequencies+=("2000")
+    _avail_timer_frequencies_text+=("2000 Hz")
+  fi
+
+  typeset -A _default_timer_frequencies_index
+  _default_timer_frequencies_index=(
+    ["pds"]="3"
+    ["muqss"]="1"
+    ["cacule"]="5"
+    ["upds"]="3"
+    ["cfs"]="3"
+    ["bmq"]="3"
+  )
+
+  if [[ -n "$_timer_freq" && ! "${_avail_timer_frequencies[*]}" =~ "$_timer_freq" ]]; then
+    warning "The entered timer frequency, ${_timer_freq}Hz, is not available, prompting..."
+    _timer_freq=""
+  fi
+
+  # Default to 500Hz if _timer_freq is not set
+  if [ -z "$_timer_freq" ]; then
+    _default_index="${_default_timer_frequencies_index[$_cpusched]}"
+    msg2 "Which kernel interrupt timer frequency would you like to use ?"
+    msg2 "Higher Hz means lower latency (but higher overhead / less throughput). So it's a double edged sword"
+    msg2 "Pick default (aka press enter with empty input) if unsure"
+    _prompt_from_array "${_avail_timer_frequencies_text[@]}"
+    _timer_freq="${_avail_timer_frequencies[$_selected_index]}"
+  fi
+
+  for _freq in "${_avail_timer_frequencies[@]}"; do
+    if [ "$_freq" = "$_timer_freq" ]; then
+      _enable "HZ_${_freq}" "HZ_${_freq}_NODEF"
+    else
+      _disable "HZ_${_freq}" "HZ_${_freq}_NODEF"
+    fi
+  done
+
+  # default cpu gov
+  if [ "$_default_cpu_gov" = "performance" ]; then
+    _disable "CPU_FREQ_DEFAULT_GOV_SCHEDUTIL"
+    _enable "CPU_FREQ_DEFAULT_GOV_PERFORMANCE" "CPU_FREQ_DEFAULT_GOV_PERFORMANCE_NODEF"
+  elif [ "$_default_cpu_gov" = "ondemand" ]; then
+    _disable "CPU_FREQ_DEFAULT_GOV_SCHEDUTIL"
+    _enable "CPU_FREQ_DEFAULT_GOV_ONDEMAND" "CPU_FREQ_GOV_ONDEMAND"
+  fi
+
+  # ftrace
+  if [ -z "$_ftracedisable" ]; then
+    plain ""
+    plain "Disable FUNCTION_TRACER/GRAPH_TRACER? Lowers overhead but limits debugging"
+    plain "and analyzing of kernel functions."
+    read -rp "`echo $'    > N/y : '`" CONDITION2;
+  fi
+  if [[ "$CONDITION2" =~ [yY] ]] || [ "$_ftracedisable" = "true" ]; then
+    _disable "FUNCTION_TRACER" "FUNCTION_GRAPH_TRACER"
+  fi
+
+  # disable numa
+  if [ -z "$_numadisable" ]; then
+    plain ""
+    plain "Disable NUMA? Lowers overhead, but breaks CUDA/NvEnc on Nvidia if disabled."
+    plain "https://bbs.archlinux.org/viewtopic.php?id=239174"
+    read -rp "`echo $'    > N/y : '`" CONDITION3;
+  fi
+  if [[ "$CONDITION3" =~ [yY] ]] || [ "$_numadisable" = "true" ]; then
+    # disable NUMA since 99.9% of users do not have multiple CPUs but do have multiple cores in one CPU
+    _disable "NUMA" "AMD_NUMA" "ACPI_NUMA" "X86_64_ACPI_NUMA" "NODES_SPAN_OTHER_NODES" "NUMA_EMU" "NODES_SHIFT" "NEED_MULTIPLE_NODES" "USE_PERCPU_NUMA_NODE_ID"
+  fi
+
+  # tickless
+  if [[ -z "$_tickless" || ! "$_tickless" =~ ^(0|1|2)$ ]]; then
+  # Set to "1" to use CattaRappa mode (enabling full tickless), "2" for tickless idle only, or "0" for periodic ticks.
+    plain "Use CattaRappa mode (Tickless/Dynticks) ?"
+    _tickless_array_text=(
+      "No, use periodic ticks."
+      "Yes, full tickless baby!\n        Can give higher performances in many cases but lower consistency on some hardware."
+      "Just tickless idle plz.\n        Just tickless idle can perform better with some platforms (mostly AMD) or CPU schedulers (mostly MuQSS)."
+    )
+    _default_index="2"
+    _prompt_from_array "${_tickless_array_text[@]}"
+    _tickless="${_selected_index}"
+  fi
+  if [ "$_tickless" = "0" ]; then
+    _disable "NO_HZ_FULL_NODEF" "NO_HZ_IDLE" "NO_HZ_FULL" "NO_HZ" "NO_HZ_COMMON"
+    _enable "HZ_PERIODIC"
+  elif [ "$_tickless" = "1" ]; then
+    _disable "HZ_PERIODIC" "NO_HZ_IDLE" "CONTEXT_TRACKING_FORCE"
+    _enable "NO_HZ_FULL_NODEF" "NO_HZ_FULL" "NO_HZ" "NO_HZ_COMMON" "CONTEXT_TRACKING"
+  else
+    _disable "NO_HZ_FULL_NODEF" "HZ_PERIODIC" "NO_HZ_FULL"
+    _enable "NO_HZ_IDLE" "NO_HZ" "NO_HZ_COMMON"
+  fi
+
+  # acs override
+  tkgpatch="$srcdir/0006-add-acs-overrides_iommu.patch"
+  if [ -e "$tkgpatch" ]; then
+    if [ -z "$_acs_override" ]; then
+      plain ""
+      plain "Use ACS override patch?"
+      plain "https://wiki.archlinux.org/index.php/PCI_passthrough_via_OVMF#Bypassing_the_IOMMU_groups_.28ACS_override_patch.29"
+      read -rp "`echo $'    > N/y : '`" CONDITION7;
+    fi
+    if [[ "$CONDITION7" =~ [yY] ]] || [ "$_acs_override" = "true" ]; then
+      _msg="Patching ACS override"
+      _tkg_patcher
+    fi
+  fi
+
+  # bcachefs
+  tkgpatch="$srcdir/0008-${_basekernel}-bcachefs.patch"
+  if [ -e "$tkgpatch" ]; then
+    if [ -z "$_bcachefs" ] && [ "$_basever" != "54" ]; then
+       plain ""
+       plain "Add Bcache filesystem support? You'll have to install bcachefs-tools-git from AUR for utilities."
+       plain "https://bcachefs.org/"
+       read -rp "`echo $'    > N/y : '`" CONDITION8;
+    fi
+    if [[ "$CONDITION8" =~ [yY] ]] || [ "$_bcachefs" = "true" ]; then
+       _msg="Patching Bcache filesystem support override"
+       _tkg_patcher
+
+       _module "BCACHEFS_FS"
+       _enable "BCACHEFS_QUOTA" "BCACHEFS_POSIX_ACL"
+       _disable "BCACHEFS_DEBUG" "BCACHEFS_TESTS" "DEBUG_CLOSURES"
+    fi
+  fi
+
+  # fsync support
+  tkgpatch="$srcdir/0007-v${_basekernel}-fsync.patch"
+  if [ -e "$tkgpatch" ]; then
+    if [ -z "$_fsync" ]; then
+      plain ""
+      plain "Enable support for fsync, an experimental replacement for esync in Valve Proton 4.11+"
+      plain "https://steamcommunity.com/games/221410/announcements/detail/2957094910196249305"
+      read -rp "`echo $'    > N/y : '`" CONDITION9;
+    fi
+    if [[ "$CONDITION9" =~ [yY] ]] || [ "$_fsync" = "true" ]; then
+      _msg="Patching Fsync support"
+      _tkg_patcher
+    fi
+  fi
+
+  # futex2 support
+  tkgpatch="$srcdir/0007-v${_basekernel}-futex2_interface.patch"
+  if [ -e "$tkgpatch" ]; then
+    if [ -z "$_futex2" ]; then
+      plain ""
+      plain "Enable support for futex2, an experimental replacement for esync and fsync in Valve Proton 5.13 experimental"
+      plain "Can be enabled alongside regular fsync patchset to have a fallback option"
+      plain "https://gitlab.collabora.com/tonyk/linux/-/tree/futex2-dev"
+      plain "https://github.com/ValveSoftware/Proton/issues/4568"
+      read -rp "`echo $'    > N/y : '`" CONDITION10;
+    fi
+    if [[ "$CONDITION10" =~ [yY] ]] || [ "$_futex2" = "true" ]; then
+      _msg="Patching futex2 support"
+      _tkg_patcher
+      _enable "FUTEX2"
+    fi
+  fi
+
+  # winesync support
+  tkgpatch="$srcdir/0007-v${_basekernel}-winesync.patch"
+  if [ -e "$tkgpatch" ]; then
+    if [ -z "$_winesync" ]; then
+      plain ""
+      plain "Enable support for winesync/fastsync, an experimental replacement for esync"
+      plain "https://repo.or.cz/linux/zf.git/shortlog/refs/heads/winesync"
+      warning "Alternatively, on Arch you can use the DKMS module which allows for using the feature on multiple kernels side by side: https://aur.archlinux.org/packages/winesync-dkms/"
+      read -rp "`echo $'    > N/y : '`" CONDITION_winesync;
+    fi
+    if [[ "$CONDITION_winesync" =~ [yY] ]] || [ "$_winesync" = "true" ]; then
+      _msg="Patching winesync/fastsync support"
+      _tkg_patcher
+      _module "WINESYNC"
+      echo "KERNEL==\"winesync\", MODE=\"0644\"" > ../winesync.rules
+      echo "winesync" > ../winesync.conf
+    fi
+  fi
+
+  # We're done with tkgpatch
+  unset tkgpatch
+  unset _msg
+
+  # Anbox modules
+  if [ "$_basever" != "54" ]; then
+    if [ -z "$_anbox" ]; then
+      plain ""
+      plain "Enable android modules for use with Anbox?"
+      plain "https://github.com/anbox/anbox"
+      read -rp "`echo $'    > N/y : '`" CONDITION12;
+    fi
+    if [[ "$CONDITION12" =~ [yY] ]] || [ "$_anbox" = "true" ]; then
+      _enable "ASHMEM" "ION" "ION_CMA_HEAP" "ANDROID" "ANDROID_BINDER_IPC" "ANDROID_BINDERFS"
+      _disable "ION_SYSTEM_HEAP" "ANDROID_BINDER_IPC_SELFTEST"
+      scripts/config --set-str "ANDROID_BINDER_DEVICES" "binder,hwbinder,vndbinder"
+      warning "Please make sure to read up on how to use this; https://github.com/Frogging-Family/linux-tkg#anbox-usage"
+      if [[ "$CONDITION12" =~ [yY] ]]; then
+        read -rp "Press enter to continue..."
+      fi
+    fi
+  fi
+
+  fi
+
+  # Community patches
+  if [ -n "$_community_patches" ]; then
+    if [ ! -d "$_where/../community-patches" ]; then
+      cd "$_where/.." && git clone https://github.com/Frogging-Family/community-patches.git && cd "${srcdir}/${_srcpath}"
+    fi
+    _community_patches=($_community_patches)
+    mkdir -p "$_where"/linux"$_basever"-tkg-userpatches
+    for _p in ${_community_patches[@]}; do
+      ln -s "$_where"/../community-patches/linux"$_basever"-tkg/$_p "$_where"/linux"$_basever"-tkg-userpatches/$_p
+    done
+  fi
+
+  # userpatches
+  if [ "$_user_patches" = "true" ]; then
+    _userpatch_target="linux-${_basekernel}"
+    _userpatch_ext="my"
+    user_patcher
+  fi
+
+  # Community patches removal
+  for _p in ${_community_patches[@]}; do
+    rm -f "$_where"/linux"$_basever"-tkg-userpatches/$_p
+  done
+
+  if [ "$_distro" = "Arch" ] || [ "$_distro" = "Void" ]; then
+    # don't run depmod on 'make install'. We'll do this ourselves in packaging
+    sed -i '2iexit 0' scripts/depmod.sh
+
+    # get kernel version
+    make prepare ${llvm_opt}
+  fi
+
+  # modprobed-db
+  if [ -z "$_modprobeddb" ]; then
+    plain ""
+    plain "Use modprobed db to clean config from unneeded modules?"
+    plain "Speeds up compilation considerably. Requires root."
+    plain "https://wiki.archlinux.org/index.php/Modprobed-db"
+    plain "!!!! Make sure to have a well populated db !!!!"
+    read -rp "`echo $'    > N/y : '`" CONDITIONMPDB;
+  fi
+  if [[ "$CONDITIONMPDB" =~ [yY] ]] || [ "$_modprobeddb" = "true" ]; then
+    if [ -f "$where"/"$_modprobeddb_db_path" ];then
+      _modprobeddb_db_path="$where"/"$_modprobeddb_db_path"
+    fi
+    if [ ! -f $_modprobeddb_db_path ]; then
+      msg2 "modprobed-db database not found"
+      exit 1
+    fi
+    # Workaround for: https://github.com/Tk-Glitch/PKGBUILDS/issues/404.
+    # Long live #404!
+    _disable "GPIO_BT8XX" "SND_SE6X"
+
+    make LSMOD=$_modprobeddb_db_path localmodconfig ${llvm_opt}
+  fi
+
+  if [ true = "$_config_fragments" ]; then
+    local fragments=()
+    mapfile -d '' -t fragments < <(find "$_where"/ -type f -name "*.myfrag" -print0)
+
+    if [ true = "$_config_fragments_no_confirm" ]; then
+      printf 'Using config fragment %s\n' "${fragments[@]#$_where/}"
+    else
+      for i in "${!fragments[@]}"; do
+        while true; do
+          read -r -p 'Found config fragment '"${fragments[$i]#$_where/}"', apply it? [y/N] ' CONDITIONMPDB
+          CONDITIONMPDB="$(printf '%s' "$CONDITIONMPDB" | tr '[:upper:]' '[:lower:]')"
+          case "$CONDITIONMPDB" in
+            y|yes)
+              break;;
+            n|no|'')
+              unset fragments[$i]
+              break;;
+            *)
+              echo 'Please answer with yes or no'
+          esac
+        done
+      done
+    fi
+
+    if [ 0 -lt "${#fragments[@]}" ]; then
+      scripts/kconfig/merge_config.sh -m .config "${fragments[@]}"
+    fi
+  fi
+
+  # set _menuconfig early for Void
+  if [ "$_distro" = "Void" ]; then
+    _menuconfig="Void"
+  fi
+
+  # rewrite configuration
+  msg2 "Setting config"
+  make olddefconfig ${llvm_opt} >> "$_where"/prepare.log
+
+  # menuconfig / nconfig
+  if [ -z "$_menunconfig" ] && [ "$_distro" != "Void" ]; then
+    plain ""
+    plain "*Optional* For advanced users - Do you want to use make menuconfig or nconfig"
+    plain "to configure the kernel before building it?"
+    plain "If you do, make sure your terminal is currently"
+    plain "at least 19 lines by 80 columns large or you'll get an error :D"
+    read -rp "`echo $'    > 0. nope\n      1. menuconfig\n      2. nconfig\n      3. xconfig\n      choice[0-3?]: '`" CONDITIONMNC;
+    _menunconfig="$CONDITIONMNC"
+  fi
+  if [ 1 = "$_menunconfig" ]; then
+    cp .config .config.orig
+    make menuconfig ${llvm_opt}
+  elif [ 2 = "$_menunconfig" ]; then
+    cp .config .config.orig
+    make nconfig ${llvm_opt}
+  elif [ 3 = "$_menunconfig" ]; then
+    cp .config .config.orig
+    make xconfig ${llvm_opt}
+  fi
+  if [ 1 = "$_menunconfig" ] || [ 2 = "$_menunconfig" ] || [ 3 = "$_menunconfig" ]; then
+    if [ -z "${_diffconfig}" ]; then
+      while true; do
+        read -r -p 'Generate a config fragment from your changes? [y/N] ' CONDITIONF
+        CONDITIONF="$(printf '%s' "$CONDITIONF" | tr '[:upper:]' '[:lower:]')"
+        case "$CONDITIONF" in
+          y|yes)
+            _diffconfig=true
+            break;;
+          n|no|'')
+            _diffconfig=false
+            break;;
+          *)
+            echo 'Please answer with yes or no'
+        esac
+      done
+    fi
+    if [ true = "$_diffconfig" ]; then
+      if [ -z "$_diffconfig_name" ]; then
+        IFS= read -r -p 'Filename for the config fragment [leave empty to not generate fragment]: ' _diffconfig_name
+      fi
+      if [ -z "$_diffconfig_name" ]; then
+        echo 'No file name given, not generating config fragment.'
+      else (
+        prev_pwd="${PWD:-$(pwd)}"
+        cd "$_where"
+        "${prev_pwd}/scripts/diffconfig" -m "${prev_pwd}/.config.orig" "${prev_pwd}/.config" > "$_diffconfig_name"
+      ) fi
+    fi
+    rm .config.orig
+  fi
+
+  if [ "$_distro" = "Arch" ]; then
+    make -s kernelrelease > version
+    msg2 "Prepared %s version %s" "$pkgbase" "$(<version)"
+  fi
+
+  # copy new config file back to the user's git folder for an eventual future use
+  cp .config "${_where}"/kernelconfig.new
+}
+
+exit_cleanup() {
+
+  # Remove temporarily copied files
+  rm -rf "$_where"/*.patch
+  rm -rf "$_where"/*-profile.cfg
+  rm -f "$_where"/config*
+  rm -f "$_where"/*.hook
+  rm -f "$_where"/cleanup
+  rm -f "$_where"/prepare
+
+  # Remove state tracker
+  rm -f "$_where"/BIG_UGLY_FROGMINER
+
+  # Remove winesync rules file
+  rm -f "$_where"/winesync.rules
+
+  # Remove RPM temporary files left
+  rm -rf ${HOME}/.cache/linux-tkg-rpmbuild
+
+  # Community patches removal in case of failure
+  for _p in ${_community_patches[@]}; do
+    rm -f "$_where"/linux"$_basever"-tkg-userpatches/"$_p"
+  done
+
+  if [ "$_NUKR" = "true" ] && [ "$_where" != "$srcdir" ]; then
+    rm -rf "$_where"/src/*
+    # Double tap
+    rm -rf "$srcdir"/linux-*
+    rm -rf "$srcdir"/*.xz
+    rm -rf "$srcdir"/*.patch
+    rm -rf "$srcdir"/*-profile.cfg
+    rm -rf "$srcdir"/*.rules
+    rm -f "$srcdir"/config.x86_64
+    rm -f "$srcdir"/customization.cfg
+
+  elif [ "$_distro" == "Arch" ]; then
+    rm -rf "$srcdir"/linux-${_basekernel}/Documentation/filesystems/aufs/*
+    rm -f "$srcdir"/linux-${_basekernel}/Documentation/ABI/testing/*-aufs
+    rm -rf "$srcdir"/linux-${_basekernel}/fs/aufs/*
+    rm -f "$srcdir"/linux-${_basekernel}/include/uapi/linux/aufs*
+
+    rm -f "$srcdir"/linux-${_basekernel}/mm/prfile.c
+
+    rm -f "$srcdir"/linux-${_basekernel}/block/bfq*
+
+    rm -rf "$srcdir"/linux-${_basekernel}/drivers/scsi/vhba/*
+
+    rm -rf "$srcdir"/linux-${_basekernel}/fs/exfat/*
+    rm -f "$srcdir"/linux-${_basekernel}/include/trace/events/fs.h
+
+    rm -f "$srcdir"/linux-${_basekernel}/Documentation/scheduler/sched-PDS-mq.txt
+    rm -f "$srcdir"/linux-${_basekernel}/include/linux/skip_list.h
+    rm -f "$srcdir"/linux-${_basekernel}/kernel/sched/pds.c
+    rm -f "$srcdir"/linux-${_basekernel}/kernel/sched/pds_sched.h
+
+    rm -f "$srcdir"/linux-${_basekernel}/Documentation/scheduler/sched-BMQ.txt
+    rm -f "$srcdir"/linux-${_basekernel}/kernel/sched/${_sched}.c
+    rm -f "$srcdir"/linux-${_basekernel}/kernel/sched/sched/alt_debug.c
+    rm -f "$srcdir"/linux-${_basekernel}/kernel/sched/alt_sched.h
+
+    rm -f "$srcdir"/linux-${_basekernel}/Documentation/scheduler/sched-BFS.txt
+    rm -f "$srcdir"/linux-${_basekernel}/Documentation/scheduler/sched-MuQSS.txt
+    rm -rf "$srcdir"/linux-${_basekernel}/arch/blackfin/*
+    rm -f "$srcdir"/linux-${_basekernel}/arch/powerpc/configs/c2k_defconfig
+    rm -f "$srcdir"/linux-${_basekernel}/arch/score/configs/spct6600_defconfig
+    rm -f "$srcdir"/linux-${_basekernel}/arch/tile/configs/tilegx_defconfig
+    rm -f "$srcdir"/linux-${_basekernel}/arch/tile/configs/tilepro_defconfig
+    rm -f "$srcdir"/linux-${_basekernel}/drivers/staging/lustre/lnet/lnet/lib-eq.c
+    rm -f "$srcdir"/linux-${_basekernel}/kernel/sched/MuQSS*
+    rm -f "$srcdir"/linux-${_basekernel}/kernel/skip_list.c
+
+    rm -f "$srcdir"/linux-${_basekernel}/Documentation/vm/uksm.txt
+    rm -f "$srcdir"/linux-${_basekernel}/include/linux/sradix-tree.h
+    rm -f "$srcdir"/linux-${_basekernel}/include/linux/uksm.h
+    rm -f "$srcdir"/linux-${_basekernel}/lib/sradix-tree.c
+    rm -f "$srcdir"/linux-${_basekernel}/mm/uksm.c
+  fi
+
+  if [ "${_distro}" = "Arch" ]; then
+    remove_deps || ( true && msg2 "remove_deps not found" )
+  fi
+
+  msg2 'exit cleanup done\n'
+  if [ -n "$_runtime" ]; then
+    msg2 "compilation time : \n$_runtime"
+  fi
+}
+if [ "$_distro" != "Void" ]; then
+  trap exit_cleanup EXIT
+fi
