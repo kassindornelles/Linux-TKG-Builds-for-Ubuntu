@@ -1,7 +1,6 @@
 DISCLAIMER: all the work here is not done by me, the responsible for getting all of this together is TKG and other people, link for his repo with PKGBUILDS and other stuff is here:
 https://github.com/Tk-Glitch/PKGBUILDS
 I am just releasing .deb's, nothing more.
-I am just releasing .deb's, nothing more (repository coming soon :tm: )
 
 Linux kernel with
 - **FSYNC and Futex2 Kernel Patch** for better performance on WINE/Proton.
